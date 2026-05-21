@@ -243,3 +243,6 @@ backend/data/wormhole_stdout.log
 
 # Compressed snapshot archives (can be 100 MB+)
 *.json.gz
+
+# Fusion v1 — operator-local env file (kept out of git; use .env.fusion.example)
+.env.fusion

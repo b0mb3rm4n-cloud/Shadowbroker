@@ -42,6 +42,7 @@ import AlertToast from '@/components/AlertToast';
 import { useAlertToasts } from '@/hooks/useAlertToasts';
 import { useWatchlist } from '@/hooks/useWatchlist';
 import WatchlistWidget from '@/components/WatchlistWidget';
+import StrikeRadarPanel from '@/components/StrikeRadarPanel';
 import {
   requestSecureMeshTerminalLauncherOpen,
   subscribeMeshTerminalOpen,
@@ -911,6 +912,23 @@ export default function Dashboard() {
         {/* MAP LEGEND */}
         <ErrorBoundary name="MapLegend">
           <MapLegend isOpen={legendOpen} onClose={() => setLegendOpen(false)} />
+        </ErrorBoundary>
+
+        {/* STRIKERADAR FUSION PANEL (renders nothing if SR proxy is unreachable) */}
+        <ErrorBoundary name="StrikeRadarPanel">
+          <StrikeRadarPanel
+            onFlyTo={({ iso }) => {
+              // Hardcoded country centroids for the 3 fusion-v1 profiles.
+              // Keep this lookup in sync with strikeradar/profiles/*.yaml bboxes.
+              const centroids: Record<string, { lat: number; lng: number }> = {
+                IR: { lat: 32.4, lng: 53.7 },
+                UA: { lat: 48.4, lng: 31.2 },
+                TW: { lat: 23.7, lng: 121.0 },
+              };
+              const c = centroids[iso.toUpperCase()];
+              if (c) handleFlyTo(c.lat, c.lng);
+            }}
+          />
         </ErrorBoundary>
 
         {/* KEYBOARD SHORTCUTS OVERLAY */}

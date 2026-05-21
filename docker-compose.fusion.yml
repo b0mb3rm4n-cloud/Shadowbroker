@@ -1,0 +1,114 @@
+# Shadowbroker ↔ StrikeRadar Pro — fusion v1 compose overlay.
+#
+# This overlay sits on top of docker-compose.yml. It rebuilds the SB
+# images from this fork's source (so the StrikeRadarPanel + proxy code
+# we added is actually present) and brings up StrikeRadar Pro as a
+# sidecar service on the same Docker network.
+#
+# Layout assumed:
+#   ~/Shadowbroker   (this fork — contains the fusion code we added)
+#   ~/strikeradar    (the StrikeRadar Pro repo, sibling directory)
+#
+# Bring up everything:
+#   cd ~/Shadowbroker
+#   cp .env.fusion.example .env.fusion          # then edit secrets
+#   docker compose --env-file .env.fusion \
+#                  -f docker-compose.yml \
+#                  -f docker-compose.fusion.yml up -d --build
+#
+# Tear down:
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.fusion.yml down
+#
+# Verify after bring-up:
+#   curl http://localhost:8000/api/health      # Shadowbroker
+#   curl http://localhost:8080/api/health      # StrikeRadar
+#   curl http://localhost:3000/api/strikeradar/api/health   # SR via SB proxy
+#   open http://localhost:3000                  # SB UI with StrikeRadar panel bottom-right
+#
+# Update the SR backend code (after editing ~/strikeradar/*):
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.fusion.yml up -d --build strikeradar
+#
+# Pull upstream Shadowbroker changes into the fork:
+#   cd ~/Shadowbroker
+#   git fetch upstream && git merge upstream/main
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.fusion.yml up -d --build
+#
+# See FUSION.md (this dir) for the architecture overview.
+
+services:
+  backend:
+    image: shadowbroker-backend:fusion
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+
+  frontend:
+    image: shadowbroker-frontend:fusion
+    build:
+      context: ./frontend
+    environment:
+      # Existing — preserved verbatim from base compose:
+      - BACKEND_URL=http://backend:8000
+      - ADMIN_KEY=${ADMIN_KEY:-}
+      # Fusion v1: where the SB Next.js proxy forwards /api/strikeradar/*.
+      # `strikeradar` is the service name below; Docker resolves it on the
+      # internal bridge network.
+      - STRIKERADAR_URL=http://strikeradar:8080
+      - STRIKERADAR_API_KEY=${STRIKERADAR_API_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+      strikeradar:
+        condition: service_healthy
+
+  strikeradar:
+    image: strikeradar:fusion
+    container_name: strikeradar
+    build:
+      context: ../strikeradar
+      dockerfile: Dockerfile
+    ports:
+      # Bind to the loopback by default so it's only reachable from this
+      # host. Set BIND=0.0.0.0 in your .env.fusion to expose it on the
+      # LAN. Mirrors Shadowbroker's binding convention.
+      - "${BIND:-127.0.0.1}:${STRIKERADAR_PORT:-8080}:8080"
+    environment:
+      # ── SR's own data sources (optional — empty values disable feeds) ──
+      - OPENSKY_USERNAME=${OPENSKY_USERNAME:-}
+      - OPENSKY_PASSWORD=${OPENSKY_PASSWORD:-}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
+      # SR's risk-history Postgres (optional — falls back to local JSON files
+      # in the volume if unset, which is fine for fusion-v1 local runs).
+      - DATABASE_URL=${SR_DATABASE_URL:-}
+      # ── Fusion v1: SR consuming SB telemetry ──
+      # The ShadowbrokerSignal in SR uses this URL. `backend` resolves to
+      # the SB backend container on the shared Docker network.
+      - SHADOWBROKER_BASE_URL=http://backend:8000
+      - SHADOWBROKER_API_KEY=${SHADOWBROKER_API_KEY:-}
+      - SHADOWBROKER_TIMEOUT_S=${SHADOWBROKER_TIMEOUT_S:-8.0}
+      # SR doesn't know about Shadowbroker by default; this turns the
+      # signal on without editing the profile YAML files. Acceptable
+      # values: "iran,ukraine,taiwan" (comma list) or empty (use YAML).
+      # NB: the YAML `shadowbroker.enabled: true` toggle is the canonical
+      # switch — this env var is a documented convenience knob you can
+      # add to SR's profile loader if you want runtime override.
+    volumes:
+      - strikeradar_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${STRIKERADAR_MEMORY_LIMIT:-1G}
+          cpus: '1'
+
+volumes:
+  strikeradar_data:
