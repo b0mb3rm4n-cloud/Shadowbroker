@@ -1,135 +1,193 @@
+"""Liveuamap scraper.
+
+Historically this module used Playwright + Stealth to bypass anti-bot guards,
+but Liveuamap actually serves the full marker dataset inline as a base64+
+url-encoded JSON blob in the HTML response (`var ovens = '...';`). Using a
+real browser was both expensive (~30s per region) and fragile — when the
+container ships without a Playwright browser binary the scraper crashes
+silently every cycle, leaving `latest_data["liveuamap"] = []`.
+
+This rewrite uses plain HTTP via `requests`, which is:
+
+- ~50x faster (no browser cold start)
+- works in slim containers without Playwright/Chromium installed
+- resilient against Turnstile JS challenges (the `ovens` blob is in the
+  initial HTML response, before any anti-bot script runs)
+"""
+
+import base64
 import json
 import logging
-import base64
-import urllib.parse
 import re
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 
-def fetch_liveuamap():
-    logger.info("Starting Liveuamap scraper with Playwright Stealth...")
+REGIONS = [
+    {"name": "Ukraine", "url": "https://liveuamap.com"},
+    {"name": "Middle East", "url": "https://mideast.liveuamap.com"},
+    {"name": "Israel-Palestine", "url": "https://israelpalestine.liveuamap.com"},
+    {"name": "Syria", "url": "https://syria.liveuamap.com"},
+]
 
-    regions = [
-        {"name": "Ukraine", "url": "https://liveuamap.com"},
-        {"name": "Middle East", "url": "https://mideast.liveuamap.com"},
-        {"name": "Israel-Palestine", "url": "https://israelpalestine.liveuamap.com"},
-        {"name": "Syria", "url": "https://syria.liveuamap.com"},
-    ]
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
-    all_markers = []
-    seen_ids = set()
+# Match `var ovens = '...';` (single or double quoted)
+_OVENS_RE = re.compile(r"var\s+ovens\s*=\s*['\"]([^'\"]+)['\"]\s*;")
 
-    with sync_playwright() as p:
-        # Launching with a real user agent to bypass Turnstile
-        browser = p.chromium.launch(
-            headless=True, args=["--disable-blink-features=AutomationControlled"]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            color_scheme="dark",
-        )
-        page = context.new_page()
-        stealth_sync(page)
 
-        for region in regions:
-            try:
-                logger.info(f"Scraping Liveuamap region: {region['name']}")
-                page.goto(region["url"], timeout=60000, wait_until="domcontentloaded")
+def _http_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    return s
 
-                # Wait for the map canvas or markers script to load, max 10s wait
-                try:
-                    page.wait_for_timeout(5000)
-                except (TimeoutError, OSError):  # non-critical: page load delay
-                    pass
 
-                html = page.content()
+def _decode_ovens(encoded: str) -> Optional[Dict[str, Any]]:
+    """Decode the `ovens` base64+url-encoded JSON blob."""
+    try:
+        b64 = urllib.parse.unquote(encoded)
+        decoded = base64.b64decode(b64).decode("utf-8", errors="replace")
+        return json.loads(decoded)
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.warning(f"Liveuamap ovens decode failed: {e}")
+        return None
 
-                m = re.search(r"var\s+ovens\s*=\s*(.*?);(?!function)", html, re.DOTALL)
-                if not m:
-                    logger.warning(f"Could not find 'ovens' data for {region['name']} in raw HTML")
-                    # Let's try grabbing the evaluated JavaScript variable if it's there
-                    try:
-                        ovens_json = page.evaluate(
-                            "() => typeof ovens !== 'undefined' ? JSON.stringify(ovens) : null"
-                        )
-                        if ovens_json:
-                            markers = json.loads(ovens_json)
-                            # process below
-                            html = f"var ovens={ovens_json};"
-                            m = re.search(r"var\s+ovens=(.*?);", html, re.DOTALL)
-                    except (ValueError, KeyError, OSError) as e:  # non-critical: JS eval fallback
-                        logger.debug(
-                            f"Could not evaluate ovens JS variable for {region['name']}: {e}"
-                        )
 
-                if m:
-                    json_str = m.group(1).strip()
-                    if json_str.startswith("'") or json_str.startswith('"'):
-                        json_str = json_str.strip("\"'")
-                        json_str = base64.b64decode(urllib.parse.unquote(json_str)).decode("utf-8")
+def _format_timestamp(ts: Any) -> str:
+    if not ts:
+        return ""
+    try:
+        ts_int = int(ts)
+        return datetime.fromtimestamp(ts_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError, OSError):
+        return str(ts)
 
-                    try:
-                        markers = json.loads(json_str)
-                        for marker in markers:
-                            mid = marker.get("id")
-                            if mid and mid not in seen_ids:
-                                seen_ids.add(mid)
-                                title = (marker.get("s") or marker.get("title") or "Unknown Event").strip()
-                                # Extract all available fields from the marker
-                                description = (marker.get("d") or marker.get("desc") or marker.get("description") or "").strip()
-                                category = (marker.get("c") or marker.get("cat") or marker.get("category") or "").strip()
-                                img = marker.get("img") or marker.get("image") or marker.get("photo") or ""
-                                source = (marker.get("source") or marker.get("src") or "").strip()
-                                event_time = marker.get("time") or marker.get("t") or ""
-                                link = marker.get("link") or marker.get("url") or ""
-                                # Format date from unix timestamp if available
-                                date_str = ""
-                                if event_time:
-                                    try:
-                                        from datetime import datetime, timezone
-                                        ts = int(event_time) if not isinstance(event_time, int) else event_time
-                                        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                                        date_str = dt.strftime("%Y-%m-%d %H:%M UTC")
-                                    except (ValueError, TypeError, OSError):
-                                        date_str = str(event_time)
-                                # Build full link URL
-                                if link and not link.startswith("http"):
-                                    base = region["url"].rstrip("/")
-                                    link = f"{base}/{link.lstrip('/')}"
-                                all_markers.append(
-                                    {
-                                        "id": mid,
-                                        "type": "liveuamap",
-                                        "title": title,
-                                        "description": description[:500] if description else "",
-                                        "lat": marker.get("lat"),
-                                        "lng": marker.get("lng"),
-                                        "timestamp": event_time,
-                                        "date": date_str,
-                                        "link": link or region["url"],
-                                        "region": region["name"],
-                                        "category": category,
-                                        "image": img,
-                                        "source": source,
-                                    }
-                                )
-                    except (json.JSONDecodeError, ValueError, KeyError) as e:
-                        logger.error(f"Error parsing JSON for {region['name']}: {e}")
 
-            except Exception as e:
-                logger.error(f"Error scraping Liveuamap {region['name']}: {e}")
+def _normalize_marker(marker: Dict[str, Any], region: Dict[str, str], seen_ids: set) -> Optional[Dict[str, Any]]:
+    mid = marker.get("id")
+    if mid is None or mid in seen_ids:
+        return None
+    seen_ids.add(mid)
 
-        browser.close()
+    title = (marker.get("name") or marker.get("s") or marker.get("title") or "Unknown Event").strip()
+    description = (marker.get("description") or marker.get("udescription") or marker.get("d") or "").strip()
+    image = marker.get("picture") or marker.get("img") or marker.get("twitpic") or ""
+    source = (marker.get("source") or marker.get("src") or "").strip()
+    raw_link = (marker.get("link") or marker.get("url") or "").strip()
+    timestamp = marker.get("timestamp") or marker.get("time") or marker.get("t") or ""
+    category = (marker.get("cat_id") or marker.get("c") or marker.get("category") or "").strip() if isinstance(
+        marker.get("cat_id"), str
+    ) else str(marker.get("cat_id", ""))
 
-    logger.info(f"Liveuamap scraper finished, extracted {len(all_markers)} unique markers.")
+    link = raw_link
+    if link and not link.startswith("http"):
+        base = region["url"].rstrip("/")
+        link = f"{base}/{link.lstrip('/')}"
+
+    lat = marker.get("lat")
+    lng = marker.get("lng")
+    try:
+        lat = float(lat) if lat not in (None, "") else None
+        lng = float(lng) if lng not in (None, "") else None
+    except (TypeError, ValueError):
+        lat, lng = None, None
+
+    return {
+        "id": mid,
+        "type": "liveuamap",
+        "title": title,
+        "description": description[:500],
+        "lat": lat,
+        "lng": lng,
+        "timestamp": timestamp,
+        "date": _format_timestamp(timestamp),
+        "link": link or region["url"],
+        "region": region["name"],
+        "category": category,
+        "image": image,
+        "source": source,
+    }
+
+
+def fetch_liveuamap() -> List[Dict[str, Any]]:
+    logger.info("Starting Liveuamap scraper (HTTP mode)...")
+    session = _http_session()
+    all_markers: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    region_stats: List[str] = []
+
+    for region in REGIONS:
+        try:
+            resp = session.get(region["url"], timeout=15)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Liveuamap {region['name']}: HTTP {resp.status_code} (skipped)"
+                )
+                continue
+            html = resp.text
+            m = _OVENS_RE.search(html)
+            if not m:
+                logger.warning(
+                    f"Liveuamap {region['name']}: 'ovens' blob not found in HTML "
+                    f"(size={len(html)})"
+                )
+                continue
+
+            payload = _decode_ovens(m.group(1))
+            if not payload:
+                continue
+
+            venues = payload.get("venues") if isinstance(payload, dict) else payload
+            if not isinstance(venues, list):
+                logger.warning(
+                    f"Liveuamap {region['name']}: unexpected payload shape "
+                    f"({type(venues).__name__})"
+                )
+                continue
+
+            count = 0
+            for marker in venues:
+                if not isinstance(marker, dict):
+                    continue
+                normalized = _normalize_marker(marker, region, seen_ids)
+                if normalized is not None:
+                    all_markers.append(normalized)
+                    count += 1
+            region_stats.append(f"{region['name']}={count}")
+        except requests.RequestException as e:
+            logger.warning(f"Liveuamap {region['name']} fetch failed: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive: unexpected parser failure
+            logger.error(f"Liveuamap {region['name']} unexpected error: {e}")
+
+    logger.info(
+        f"Liveuamap scraper finished: {len(all_markers)} unique markers "
+        f"({', '.join(region_stats) if region_stats else 'no regions returned data'})"
+    )
     return all_markers
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     res = fetch_liveuamap()
-    print(json.dumps(res[:3], indent=2))
+    print(json.dumps(res[:3], indent=2, default=str))

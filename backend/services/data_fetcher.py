@@ -825,6 +825,7 @@ def start_scheduler():
         id="liveuamap",
         max_instances=1,
         misfire_grace_time=120,
+        next_run_time=datetime.now() + timedelta(seconds=20),
     )
 
     # CCTV pipeline refresh — runs all ingestors, then refreshes in-memory data.

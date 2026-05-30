@@ -1,7 +1,9 @@
 """Military flight tracking and UAV detection from ADS-B data."""
 
+import hashlib
 import json
 import logging
+import re
 import time
 import requests
 from services.network_utils import fetch_with_curl
@@ -10,6 +12,96 @@ from services.fetchers.emissions import get_emissions_info
 from services.fetchers.plane_alert import enrich_with_plane_alert
 
 logger = logging.getLogger("services.data_fetcher")
+
+# ---------------------------------------------------------------------------
+# UAV news-supplement
+# ---------------------------------------------------------------------------
+# ADS-B-based UAV detection (above) only catches military drones broadcasting
+# Mode-S/ADS-B (RQ-4, MQ-9, etc). It MISSES the dominant operational reality:
+# Shahed/Geran kamikaze drones, Lancet loitering munitions, FPV/quad attacks,
+# Bayraktar TB2 in EMCON, etc. — none of which transmit ADS-B.
+#
+# To prevent the UAV feed from going empty during periods when no high-end
+# manned UAV is broadcasting, supplement detected_uavs with drone-tagged
+# events from Liveuamap (already collected on a 30 min cadence). These are
+# tagged source_type="news" so downstream consumers can weight them lower
+# than ADS-B-confirmed contacts but still register UAV activity.
+_UAV_NEWS_KEYWORDS = (
+    "drone", "uav", "shahed", "geran", "lancet", "bayraktar", "tb2", "tb-2",
+    "mq-9", "mq9", "rq-4", "rq4", "kamikaze", "fpv", "loitering munition",
+    "reaper", "global hawk", "predator", "orlan", "mohajer", "suicide drone",
+    "unmanned", "iranian-made drone", "russian drone", "ukrainian drone",
+    "houthi drone", "swarm",
+)
+_UAV_NEWS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _UAV_NEWS_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _harvest_uav_news_events(max_items: int = 60):
+    """Return list of inferred UAV markers from Liveuamap drone-tagged items.
+
+    Each marker mimics the ADS-B uavs[] schema (id, lat, lng, country, type)
+    so existing downstream distillers don't need changes.
+    """
+    try:
+        with _data_lock:
+            lum = list(latest_data.get("liveuamap") or [])
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"UAV news supplement: liveuamap unavailable: {e}")
+        return []
+
+    if not lum:
+        return []
+
+    inferred = []
+    seen_keys = set()
+    for marker in lum:
+        if not isinstance(marker, dict):
+            continue
+        text = f"{marker.get('title','')} {marker.get('description','')}"
+        if not _UAV_NEWS_RE.search(text):
+            continue
+        lat = marker.get("lat")
+        lng = marker.get("lng")
+        if lat is None or lng is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lng_f = float(lng)
+        except (TypeError, ValueError):
+            continue
+        # Coarse de-duplicate on rounded coords + first 60 chars of title
+        title = (marker.get("title") or "")[:60]
+        dedup_key = f"{round(lat_f, 1)}|{round(lng_f, 1)}|{title.lower()}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        mid = marker.get("id") or hashlib.md5(dedup_key.encode("utf-8")).hexdigest()[:12]
+        inferred.append({
+            "id": f"uav-news-{mid}",
+            "type": "uav",
+            "uav_type": "Inferred (news)",
+            "source_type": "news_inferred",
+            "source": "liveuamap",
+            "region": marker.get("region", ""),
+            "title": (marker.get("title") or "")[:200],
+            "description": (marker.get("description") or "")[:500],
+            "lat": lat_f,
+            "lng": lng_f,
+            "timestamp": marker.get("timestamp", ""),
+            "date": marker.get("date", ""),
+            "link": marker.get("link", ""),
+            "icao24": "",
+            "callsign": "",
+            "model": "",
+            "country": "",
+            "confidence": "low",
+        })
+        if len(inferred) >= max_items:
+            break
+    return inferred
 
 # ---------------------------------------------------------------------------
 # UAV classification — filters military drone transponders
@@ -279,11 +371,30 @@ def fetch_military_flights():
             if latest_data.get("military_flights"):
                 return
 
+    # Supplement ADS-B UAVs with drone-tagged news/OSINT events. This guarantees
+    # the uavs[] feed reflects real-world drone activity even when no high-end
+    # military UAV is currently broadcasting ADS-B (the common case for
+    # Shahed/Lancet/FPV swarms which never appear on ADS-B).
+    news_uavs = _harvest_uav_news_events()
+
+    combined_uavs = list(detected_uavs)
+    seen_coords = {(round(float(u.get("lat", 0)), 1), round(float(u.get("lng", 0)), 1))
+                   for u in combined_uavs if u.get("lat") is not None and u.get("lng") is not None}
+    for nu in news_uavs:
+        coord = (round(nu["lat"], 1), round(nu["lng"], 1))
+        if coord in seen_coords:
+            continue
+        seen_coords.add(coord)
+        combined_uavs.append(nu)
+
     with _data_lock:
         latest_data["military_flights"] = military_flights
-        latest_data["uavs"] = detected_uavs
+        latest_data["uavs"] = combined_uavs
     _mark_fresh("military_flights", "uavs")
-    logger.info(f"UAVs: {len(detected_uavs)} real drones detected via ADS-B")
+    logger.info(
+        f"UAVs: {len(detected_uavs)} ADS-B + {len(combined_uavs) - len(detected_uavs)} "
+        f"news-inferred = {len(combined_uavs)} total"
+    )
 
     # Cross-reference military flights with Plane-Alert DB
     tracked_mil = []
