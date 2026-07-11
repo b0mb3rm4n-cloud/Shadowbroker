@@ -4,7 +4,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from limiter import limiter
 from auth import require_admin
-from services.data_fetcher import get_latest_data
 from services.schemas import HealthResponse
 import os
 
@@ -38,10 +37,34 @@ def _get_start_time() -> float:
 @router.get("/api/health", response_model=HealthResponse)
 @limiter.limit("30/minute")
 async def health_check(request: Request):
-    from services.fetchers._store import get_source_timestamps_snapshot
-    from services.slo import compute_all_statuses, summarise_statuses
+    from services.fetchers._store import (
+        get_latest_data_subset_refs,
+        get_source_timestamps_snapshot,
+    )
+    from services.slo import SLO_REGISTRY, compute_all_statuses, summarise_statuses
 
-    d = get_latest_data()
+    # Read only the keys this probe needs, by reference — never deep-copy the
+    # entire dashboard store here. A full deepcopy of the live store on the
+    # event-loop thread (this endpoint backs the Docker healthcheck) pins a CPU
+    # core and times out the probe, marking the container unhealthy. Both the
+    # source counts below and compute_all_statuses() only call len() on these
+    # values, so passing references is safe.
+    _count_keys = (
+        "commercial_flights",
+        "military_flights",
+        "ships",
+        "satellites",
+        "earthquakes",
+        "cctv",
+        "news",
+        "uavs",
+        "firms_fires",
+        "liveuamap",
+        "gdelt",
+        "uap_sightings",
+    )
+    _needed_keys = set(_count_keys) | set(SLO_REGISTRY.keys()) | {"last_updated"}
+    d = get_latest_data_subset_refs(*_needed_keys)
     last = d.get("last_updated")
     timestamps = get_source_timestamps_snapshot()
     slo_statuses = compute_all_statuses(d, timestamps)
@@ -82,4 +105,6 @@ async def health_check(request: Request):
 @router.get("/api/debug-latest", dependencies=[Depends(require_admin)])
 @limiter.limit("30/minute")
 async def debug_latest_data(request: Request):
-    return list(get_latest_data().keys())
+    from services.fetchers._store import latest_data
+
+    return list(latest_data.keys())

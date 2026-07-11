@@ -3532,7 +3532,25 @@ async def update_layers(update: LayerUpdate, request: Request):
 @app.get("/api/live-data")
 @limiter.limit("120/minute")
 async def live_data(request: Request):
-    return get_latest_data()
+    from starlette.concurrency import run_in_threadpool
+    from fastapi.encoders import jsonable_encoder
+
+    # Legacy full-store dump. Both the deep copy AND the JSON serialization of
+    # the entire dashboard store are expensive and, if done on the event-loop
+    # thread, stall health checks and hot-path polling for every other client
+    # until they finish. Render the whole response in the threadpool and return
+    # pre-encoded bytes so the loop is never blocked by this endpoint.
+    def _render() -> bytes:
+        data = get_latest_data()
+        return json_mod.dumps(
+            jsonable_encoder(data),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    content = await run_in_threadpool(_render)
+    return Response(content=content, media_type="application/json")
 
 
 def _etag_response(request: Request, payload: dict, prefix: str = "", default=None):
@@ -8312,9 +8330,33 @@ async def cctv_media_proxy(request: Request, url: str = Query(...)):
 @limiter.limit("30/minute")
 async def health_check(request: Request):
     import time
-    from services.fetchers._store import get_source_timestamps_snapshot
+    from services.fetchers._store import (
+        get_latest_data_subset_refs,
+        get_source_timestamps_snapshot,
+    )
 
-    d = get_latest_data()
+    # Read only the keys this probe needs, by reference — never deep-copy the
+    # entire dashboard store here. This endpoint is hit every few seconds by the
+    # Docker healthcheck, the frontend, and external probes; a full deepcopy of
+    # the live store (tens of thousands of flights/vessels/signals/trails) on the
+    # event-loop thread pins a CPU core and blows past the healthcheck timeout,
+    # which is what marks the container unhealthy. len() on the referenced lists
+    # is safe because writers replace top-level values under the lock rather than
+    # mutating them in place.
+    d = get_latest_data_subset_refs(
+        "last_updated",
+        "commercial_flights",
+        "military_flights",
+        "ships",
+        "satellites",
+        "earthquakes",
+        "cctv",
+        "news",
+        "uavs",
+        "firms_fires",
+        "liveuamap",
+        "gdelt",
+    )
     last = d.get("last_updated")
     return {
         "status": "ok",
